@@ -10,61 +10,98 @@ MAKEFLAGS += --no-builtin-rules
 CONFDIR ?= ./kube-config
 OBJS := calico dashboard example flannel heapster hostpath metrics-server
 HELP := =y print this help information
-debug ?= false
+d ?= False
 s ?= istio  # scenario
-where ?= vms
+w ?= vms
 p ?= pod1 # lowercase p, pod name
 P ?= cactus # uppercase P, prefix for node name
+l ?= vms
 
 define INSTALL_HELP
 # Deploy k8s locally or on vms.
 #
 # Args:
-#   help: $(HELP)
-#   where: local or vms
+#   h: $(HELP)
+#   w: local or vms
 #   s: scenario, defined under config/scenario, default by istio
 #   p: pod name, definded under config/labs, default by pod1
 #   P: prefix for node name, default by cactus
+#   l: cleanup level, dib=all resources, sto=all except dib image, vms=only vms and networks, default by vms
 # Example:
-#   make install where=vms
+#   make install w=vms
 #   
 endef
 .phone: install
-ifeq ($(help), y)
+ifeq ($(h), y)
 install:
 	@echo "$$INSTALL_HELP"
-else ifeq ($(where), local)
+else ifeq ($(w), local)
 install:
 	bash k8s/k8sm.sh
 else
 install:
-	sudo CI_DEBUG=$(debug) bash deploy/deploy.sh -s $(s) -p $(p) -P $(P)
+	sudo CI_DEBUG=$(debug) bash deploy/deploy.sh -s $(s) -p $(p) -P $(P) -l $(l)
 endif
 
+define STOP_HELP
+# STOP k8s deployment.
+#
+# Args:
+#   h: $(HELP)
+# Example:
+#   make stop
+#
+endef
 .phone: stop
+ifeq ($(h), y)
+stop:
+	@echo "$$STOP_HELP"
+else
 stop: 
 	bash ./stop.sh
+endif
 
+define CLEAN_HELP
+# Clean k8s deployment envs.
+#
+# Args:
+#   h: $(HELP)
+#   s: scenario, defined under config/scenario, default by istio
+#   p: pod name, definded under config/labs, default by pod1
+#   l: cleanup level, dib=all resources, sto=all except dib image, vms=only vms and networks, default by vms
+#   P: uppercase, prefix for node name, default by cactus
+# Example:
+#   make clean s=istio P=cactus c=dib
+#
+endef
+.phone: clean
+ifeq ($(h), y)
+clean:
+	@echo "$$CLEAN_HELP"
+else
+clean:
+	sudo CI_DEBUG=$(debug) bash deploy/clean.sh -P $(P) -s $(s) -l $(l) -p $(p)
+endif
 
 define APPLY_HELP
 # Apply objects on k8s.
 #
 # Args:
-#   help: $(HELP)
-#   what: Object to apply, supported objects: $(OBJS)
+#   h: $(HELP)
+#   o: Object to apply, supported objects: $(OBJS)
 #
 # Example:
-#   make apply what=metrics-server
+#   make apply o=metrics-server
 #   
 endef
 
 .phone: apply
-ifeq ($(help), y)
+ifeq ($(h), y)
 apply:
 	@echo "$$APPLY_HELP"
 else
 apply:
-	kubectl apply -f $(CONFDIR)/$(what)
+	kubectl apply -f $(CONFDIR)/$(o)
 endif
 
 
@@ -72,19 +109,19 @@ define REMOVE_HELP
 # Remove objects.
 #
 # Args:
-#   help: $(HELP)
-#   what: Object to delete, supported objects: $(OBJS)
+#   h: $(HELP)
+#   o: Object to delete, supported objects: $(OBJS)
 #   
 # Example:
-#   make delete what=metrics-server
+#   make delete o=metrics-server
 #   
 endef
 .phone: delete
-ifeq ($(help), y)
+ifeq ($(h), y)
 delete:
 	@echo "$$REMOVE_HELP"
 else
 delete:
-	kubectl delete -f $(CONFDIR)/$(what)
+	kubectl delete -f $(CONFDIR)/$(o)
 endif
 

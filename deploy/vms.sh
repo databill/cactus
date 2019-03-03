@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 
 BRIDGE_IDENTITY="idf_cactus_jumphost_bridges_"
+builder_image=cactus/dib:latest
+dib_name=cactus_image_builder
+
+function imagedir {
+  echo ${STORAGE_DIR}/k8s_${cluster_version}
+}
+
+function diskdir {
+  echo ${STORAGE_DIR}/${PREFIX}_${cluster_version}
+}
 
 function __get_bridges {
   set +x
-  compgen -v |
+  compgen -v ${BRIDGE_IDENTITY} |
   while read var; do {
-    [[ ${var} =~ ${BRIDGE_IDENTITY} ]] && echo ${var#${BRIDGE_IDENTITY}}
+    echo ${var#${BRIDGE_IDENTITY}}
   }
   done || true
   [[ "${CI_DEBUG}" =~ (false|0) ]] || set -x
 }
 
 function prepare_networks {
-  local brs=$(__get_bridges)
   read -r -a BR_NAMES <<< $(__get_bridges)
 
   [[ ! "${BR_NAMES[@]}" =~ "admin" ]] && {
@@ -35,8 +44,6 @@ EOF" 2> /dev/null > "${TMP_DIR}/$(basename ${tp%.template})"
 }
 
 function build_images {
-  local builder_image=cactus/dib:latest
-  local dib_name=cactus_image_builder
   local sshpub="${SSH_KEY}.pub"
 
   [[ "$(docker images -q ${builder_image} 2>/dev/null)" != "" ]] || {
@@ -67,42 +74,45 @@ function cleanup_vms {
       xargs --no-run-if-empty -I{} sudo rm -f {}
     # TODO command 'undefine' doesn't support option --nvram
     virsh undefine "${node}" --remove-all-storage
-    #ssh-keygen -f $(eval echo ~${SUDO_USER})/.ssh/known_hosts -R $(get_admin_ip ${node##${PREFIX}_}) || true
-    ssh-keygen -R $(get_admin_ip ${node##${PREFIX}_}) || true
+    ip=$(get_admin_ip ${node##${PREFIX}_})
+    sudouser_exc "ssh-keygen -R ${ip}"
+    ssh-keygen -R ${ip} || true
   done
 }
 
 function prepare_vms {
-  local image_dir=${STORAGE_DIR}/k8s_${cluster_version}
-  local disk_dir=${STORAGE_DIR}/${PREFIX}_${cluster_version}
-  mkdir ${disk_dir} || true
-  cleanup_vms
+  mkdir $(diskdir) || true
 
   # Create vnode images and resize OS disk image for each foundation node VM
   for vnode in "${vnodes[@]}"; do
     if [ $(eval echo "\$nodes_${vnode}_enabled") == "True" ]; then
-      if is_master ${vnode}; then
-        echo "preparing for master vnode [${vnode}]"
-        image="master.qcow2"
-      else
-        echo "preparing for minion vnode [${vnode}]"
-        image="minion.qcow2"
-      fi
-      cp "${image_dir}/${image}" "${disk_dir}/${vnode}.qcow2"
+      role=$(get_role $vnode)
+      echo "preparing for $role vnode: [${vnode}]"
+      image="${role}.qcow2"
+      cp "$(imagedir)/${image}" "$(diskdir)/${vnode}.qcow2"
       disk_capacity="nodes_${vnode}_node_disk"
-      qemu-img resize "${disk_dir}/${vnode}.qcow2" ${!disk_capacity}
+      qemu-img resize "$(diskdir)/${vnode}.qcow2" ${!disk_capacity}
     fi
   done
 }
 
-function create_networks {
-  # create required networks
+function cleanup_networks {
+  read -r -a BR_NAMES <<< $(__get_bridges)
+
   for br in "${BR_NAMES[@]}"; do
     net=$(eval echo "\$${BRIDGE_IDENTITY}${br}")
     if virsh net-info "${net}" >/dev/null 2>&1; then
       virsh net-destroy "${net}" || true
       virsh net-undefine "${net}"
     fi
+  done
+}
+
+function create_networks {
+
+  # create required networks
+  for br in "${BR_NAMES[@]}"; do
+    net=$(eval echo "\$${BRIDGE_IDENTITY}${br}")
     # in case of custom network, host should already have the bridge in place
     if [ -f "${TMP_DIR}/net_${br}.xml" ] && [ ! -d "/sys/class/net/${net}/bridge" ]; then
       virsh net-define "${TMP_DIR}/net_${br}.xml"
@@ -193,3 +203,14 @@ function check_connection {
   done
   set -e
 }
+
+function cleanup_dib {
+  docker ps -a | grep ${dib_name} | awk '{print $1}' | xargs -I {} docker rm -f {} &>/dev/null
+  docker rmi ${builder_image} || true
+}
+
+function cleanup_sto {
+  rm -fr $(imagedir) || true
+  rm -fr $(diskdir) || true
+}
+

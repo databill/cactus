@@ -3,7 +3,7 @@
 REMOTE_KUBECONF=/home/cactus/.kube
 LOCAL_KUBECONF=$HOME/.kube
 LOCAL_KUBEDIR="${REPO_ROOT_PATH}/kube-config"
-
+helm=$(which helm)
 
 function parse_labels {
   set +x
@@ -29,8 +29,9 @@ function get_kube_join {
 
 function kube_exc {
   local cmdstr=${1}
+  local no_error=${2:-true}
   [[ ${ONSITE} -eq 0 ]] && {
-    eval "${cmdstr}"
+    sudouser_exc "${cmdstr}" ${no_error}
   } || {
     master_exc "${cmdstr}"
   }
@@ -38,7 +39,7 @@ function kube_exc {
 
 function kube_apply {
   [[ ${ONSITE} -eq 0 ]] && {
-    kubectl apply -f ${LOCAL_KUBEDIR}/${1}
+    sudouser_exc "kubectl apply -f ${LOCAL_KUBEDIR}/${1}"
   } || {
     master_exc "kubectl apply -f ${REMOTE_KUBECONF}/${1}"
   }
@@ -50,31 +51,14 @@ function render_service_cidr {
    }
 }
 
-function render_istio {
- [[ -n "${cluster_states_objects[@]}" ]] && [[ "${cluster_states_objects[@]}" =~ "istio" ]] && {
-    echo ",MutatingAdmissionWebhook,ValidatingAdmissionWebhook"
-  }
-}
-
 function compose_kubeadm_config {
+  template=${DEPLOY_DIR}/templates/kubeadm-${cluster_version%.*}.template
   vnode=${1}
-
   [[ -n ${cluster_pod_cidr} ]] && cluster_pod_cidr="10.244.0.0/16"
-  cat << KUBEADM > ${TMP_DIR}/kubeadm.conf 
-apiVersion: kubeadm.k8s.io/v1alpha2
-kind: MasterConfiguration
-api:
-  advertiseAddress: $(get_mgmt_ip ${vnode})
-apiServerExtraArgs:
-  enable-admission-plugins: NodeRestriction$(render_istio)
-networking:
-  podSubnet: ${cluster_pod_cidr}
-  $(render_service_cidr)
-kubernetesVersion: ${cluster_version}
-clusterName: ${cluster_name}
-nodeRegistration:
-  name: $(eval echo "\$nodes_${vnode}_hostname")
-KUBEADM
+
+  eval "cat <<-EOF
+$(<"${template}")
+EOF" 2> /dev/null > ${TMP_DIR}/kubeadm.conf
 }
 
 function cal_nr_hugepages {
@@ -124,10 +108,11 @@ DEPLOY_MASTER
 
       [[ ${ONSITE} -eq 0 ]] && {
         local conf=${LOCAL_KUBECONF}/config
-        [[ ! -d ${LOCAL_KUBECONF} ]] && mkdir ${LOCAL_KUBECONF}
-        [[ -f ${conf} ]] && rm -fr ${conf}
-        scp ${SSH_OPTS} ${sshe}:${REMOTE_KUBECONF}/config ${LOCAL_KUBECONF}
-        chown -R $(id -u ${SUDO_USER}):$(id -g ${SUDO_USER}) ${LOCAL_KUBECONF}
+        sudouser_exc "
+          mkdir ${LOCAL_KUBECONF} || true
+          rm -fr ${conf} || true
+          scp ${SSH_OPTS} ${sshe}:${REMOTE_KUBECONF}/config ${LOCAL_KUBECONF} || true
+        "
       }
     fi
   done
@@ -180,7 +165,7 @@ function wait_cluster_ready {
   set +e
   echo "Wait for cluster to be ready ....."
   for attempt in $(seq "${total_attempts}"); do
-    kube_exc "kubectl get nodes | grep -v NotReady | grep Ready"
+    kube_exc "kubectl get nodes | grep -v NotReady | grep Ready" false
     case $? in
       0) echo "${attempt}> Success"; break ;;
       *) echo "${attempt}/${total_attempts}> cluster ain't ready yet, waiting for ${sleep_time} seconds ..." ;;
@@ -198,17 +183,60 @@ function wait_cluster_ready {
 function deploy_objects {
   [[ -n "${cluster_states_objects[@]}" ]] && {
     for obj in "${cluster_states_objects[@]}"; do
-      [[ ${obj} =~ "istio" ]] && {
-        kube_apply istio/crds.yaml
-        sleep 5
-        # in case some objects deploy failed for the first time
-        # due to the resources referenced are not created yet
-        kube_apply istio/${obj}.yaml
-        kube_apply istio/${obj}.yaml
-        kube_exc "kubectl label namespace default istio-injection=enabled"
-      } || {
-        kube_apply ${obj}
-      }
+      kube_apply ${obj}
     done
-  }
+  } || true
 }
+
+function deploy_helm {
+  [[ -n "${cluster_states_helm_version}" ]] && {
+    ssh ${SSH_OPTS} cactus@$(get_master) bash -s -e << DEPLOY_HELM
+      set -ex
+
+      echo -n "Begin to install helm ..."
+      curl https://raw.githubusercontent.com/kubernetes/helm/${cluster_states_helm_version}/scripts/get > ./get
+      chmod +x ./get
+      bash ./get -v ${cluster_states_helm_version}
+
+      helm init --wait --service-account tiller || true
+      helm repo remove stable || true
+      helm version || true
+DEPLOY_HELM
+
+    [[ ${ONSITE} -eq 0 ]] && {
+      echo "Init local helm client,for debug local chart ..."
+      sudouser_exc "
+        rm -fr ~/.helm
+        helm init --client-only 
+        helm repo remove stable
+        helm version
+      "
+    }
+  }
+
+  [[ -n "${cluster_states_helm_repos[@]}" ]] && {
+    echo -n "Begin to add repos ..."
+    for repo in "${cluster_states_helm_repos[@]}"; do
+      IFS='|' read -a repo_i <<< "${repo}"
+      echo -n "Add repo: ${repo_i[0]}|${repo_i[1]}"
+      master_exc "helm repo add ${repo_i[0]} ${repo_i[1]}" || true
+    done
+  } || true
+ 
+  [[ -n "${cluster_states_helm_charts[@]}" ]] && {
+    echo -n "Begin to install charts"
+    for chart in "${cluster_states_helm_charts[@]}"; do
+      IFS='|' read -a r_i <<< "${chart}"
+      r_chart=${r_i[0]}
+      [[ -n ${r_i[1]} ]] && r_name="--name ${r_i[1]}"
+      [[ -n ${r_i[2]} ]] && r_version="--version ${r_i[2]}"
+      [[ -n ${r_i[3]} ]] && {
+        kube_exc "kubectl create namespace ${r_i[3]}" || true
+        r_namespace="--namespace ${r_i[3]}"
+      }
+      echo -n "Install chart: ${r_i}"
+      master_exc "helm install ${r_name} ${r_version} ${r_namespace} ${r_chart}" || true
+    done
+  } || true
+}
+
